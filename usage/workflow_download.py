@@ -3,8 +3,13 @@ from jmcomic.cl import JmcomicUI
 
 # 下方填入你要下载的本子的id，一行一个，每行的首尾可以有空白字符
 jm_albums = '''
-https://18comic.vip/album/288057
-https://18comic.vip/album/288065
+https://18comic.vip/album/530478
+https://18comic.vip/album/527863
+https://18comic.vip/album/522481
+https://18comic.vip/album/522485
+https://18comic.vip/album/516631
+https://18comic.vip/album/499798
+https://18comic.vip/album/438925
 
 '''
 
