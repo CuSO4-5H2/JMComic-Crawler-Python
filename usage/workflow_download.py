@@ -3,17 +3,38 @@ from jmcomic.cl import JmcomicUI
 
 # 下方填入你要下载的本子的id，一行一个，每行的首尾可以有空白字符
 jm_albums = '''
-https://18comic.vip/album/482006
-https://18comic.vip/album/481822
-https://18comic.vip/album/309626
-https://18comic.vip/album/309625
-https://18comic.vip/album/309279
-https://18comic.vip/album/309278
-https://18comic.vip/album/308883
-https://18comic.vip/album/308468
-https://18comic.vip/album/279105
-https://18comic.vip/album/143057
-https://18comic.vip/album/574632
+https://18comic.vip/album/581515
+https://18comic.vip/album/581514
+https://18comic.vip/album/581513
+https://18comic.vip/album/569869
+https://18comic.vip/album/568328
+https://18comic.vip/album/563510
+https://18comic.vip/album/554246
+https://18comic.vip/album/552182
+https://18comic.vip/album/552179
+https://18comic.vip/album/550878
+https://18comic.vip/album/549896
+https://18comic.vip/album/545225
+https://18comic.vip/album/545213
+https://18comic.vip/album/544413
+https://18comic.vip/album/544408
+https://18comic.vip/album/544397
+https://18comic.vip/album/544384
+https://18comic.vip/album/542222
+https://18comic.vip/album/542216
+https://18comic.vip/album/542194
+https://18comic.vip/album/539890
+https://18comic.vip/album/534047
+https://18comic.vip/album/532383
+https://18comic.vip/album/529473
+https://18comic.vip/album/527518
+https://18comic.vip/album/527307
+https://18comic.vip/album/526668
+https://18comic.vip/album/526420
+https://18comic.vip/album/519239
+https://18comic.vip/album/502333
+https://18comic.vip/album/502325
+https://18comic.vip/album/460122
 '''
 
 # 单独下载章节
