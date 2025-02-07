@@ -1,6 +1,6 @@
 name: Run Test (API)
 
-on:
+#on:
   schedule:
     - cron: "0 0 * * *"
   workflow_dispatch:
@@ -12,7 +12,7 @@ on:
       - '.github/workflows/test_api.yml'
       - 'assets/option/option_test_api.yml'
 
-jobs:
+#jobs:
   test: # This code is based on https://github.com/gaogaotiantian/viztracer/blob/master/.github/workflows/python-package.yml
     strategy:
       matrix:
