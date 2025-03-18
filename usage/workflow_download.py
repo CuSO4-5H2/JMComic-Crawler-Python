@@ -12,7 +12,7 @@ https://18comic.vip/album/599902/
 https://18comic.vip/album/554247/
 https://18comic.vip/album/552177/
 https://18comic.vip/album/530287/
-https://18comic.vip/album/511940/
+https://18comic.vip/album/511940
 '''
 
 # 单独下载章节
