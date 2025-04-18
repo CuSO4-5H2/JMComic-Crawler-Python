@@ -13,7 +13,6 @@ https://18comic.vip/album/1013188/
 https://18comic.vip/album/584042/
 https://18comic.vip/album/579625/
 https://18comic.vip/album/578564/
-https://18comic.vip/album/578546/
 https://18comic.vip/album/627196/
 '''
 
