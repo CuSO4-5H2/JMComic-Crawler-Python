@@ -3,10 +3,18 @@ from jmcomic.cl import JmcomicUI
 
 # 下方填入你要下载的本子的id，一行一个，每行的首尾可以有空白字符
 jm_albums = '''
-https://18comic.vip/album/1198925/
-https://18comic.vip/album/1194642/
-https://18comic.vip/album/1189277/
-https://18comic.vip/album/1117868/
+https://18comic.vip/album/1220356/
+https://18comic.vip/album/1220083/
+https://18comic.vip/album/1219397/
+https://18comic.vip/album/1217402/
+https://18comic.vip/album/1216442/
+https://18comic.vip/album/1209621/
+https://18comic.vip/album/1209531/
+https://18comic.vip/album/1195422/
+https://18comic.vip/album/1180206/
+https://18comic.vip/album/1169863/
+https://18comic.vip/album/1169862/
+https://18comic.vip/album/1169859/
 '''
 
 # 单独下载章节
