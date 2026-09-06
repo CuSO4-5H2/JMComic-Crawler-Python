@@ -39,8 +39,6 @@ https://18comic.vip/album/1212621/
 # 单独下载章节
 jm_photos = '''
 
-
-
 '''
 
 
