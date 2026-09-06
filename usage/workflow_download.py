@@ -8,32 +8,6 @@ https://18comic.vip/album/1452696/
 https://18comic.vip/album/1452513/
 https://18comic.vip/album/1452523/
 https://18comic.vip/album/1452524/
-https://18comic.vip/album/1451024/
-https://18comic.vip/album/1451009/
-https://18comic.vip/album/1451012/
-https://18comic.vip/album/1451016/
-https://18comic.vip/album/1451002/
-https://18comic.vip/album/1423542/
-https://18comic.vip/album/1251297/
-https://18comic.vip/album/1251296/
-https://18comic.vip/album/1251295/
-https://18comic.vip/album/1251294/
-https://18comic.vip/album/1251293/
-https://18comic.vip/album/1251292/
-https://18comic.vip/album/1251291/
-https://18comic.vip/album/1251290/
-https://18comic.vip/album/1251288/
-https://18comic.vip/album/1251287/
-https://18comic.vip/album/1251286/
-https://18comic.vip/album/1251285/
-https://18comic.vip/album/1251284/
-https://18comic.vip/album/1251280/
-https://18comic.vip/album/1251279/
-https://18comic.vip/album/1251278/
-https://18comic.vip/album/1213427/
-https://18comic.vip/album/1213134/
-https://18comic.vip/album/1212625/
-https://18comic.vip/album/1212621/
 '''
 
 # 单独下载章节
