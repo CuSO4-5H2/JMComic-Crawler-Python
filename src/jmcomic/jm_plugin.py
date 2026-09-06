@@ -1,9 +1,14 @@
 """
 该文件存放的是option插件
 """
-import os.path
+
+from collections import deque
+from threading import RLock
 
 from .jm_option import *
+from .jm_async_downloader import JmAsyncDownloader
+from .jm_downloader import JmDownloader
+from .jm_task_context import bind_jm_task_context, get_jm_task_context
 
 
 class PluginValidationException(Exception):
@@ -28,6 +33,11 @@ class JmOptionPlugin:
         """
         raise NotImplementedError
 
+    @property
+    def jm_task_context(self) -> dict:
+        """Return the current invocation's isolated task-context snapshot."""
+        return get_jm_task_context()
+
     @classmethod
     def build(cls, option: JmOption) -> 'JmOptionPlugin':
         """
@@ -37,7 +47,7 @@ class JmOptionPlugin:
         return cls(option)
 
     def log(self, msg, topic=None):
-        if self.log_enable is not True:
+        if not self.log_enable:
             return
 
         jm_log(
@@ -57,18 +67,19 @@ class JmOptionPlugin:
 
         raise PluginValidationException(self, msg)
 
-    def warning_lib_not_install(self, lib: str):
+    def warning_lib_not_install(self, lib: str, throw=False):
         msg = (f'插件`{self.plugin_key}`依赖库: {lib}，请先安装{lib}再使用。'
                f'安装命令: [pip install {lib}]')
         import warnings
         warnings.warn(msg)
+        self.require_param(throw, msg)
 
     def execute_deletion(self, paths: List[str]):
         """
         删除文件和文件夹
         :param paths: 路径列表
         """
-        if self.delete_original_file is not True:
+        if not self.delete_original_file:
             return
 
         for p in paths:
@@ -76,6 +87,9 @@ class JmOptionPlugin:
                 continue
 
             if os.path.isdir(p):
+                if os.listdir(p):
+                    self.log(f'文件夹中存在非本次下载的文件，请手动删除文件夹内的文件: {p}', 'remove.ignore')
+                    continue
                 os.rmdir(p)
                 self.log(f'删除文件夹: {p}', 'remove')
             else:
@@ -104,6 +118,37 @@ class JmOptionPlugin:
     def wait_until_finish(self):
         pass
 
+    # noinspection PyMethodMayBeStatic
+    def decide_filepath(self,
+                        album: Optional[JmAlbumDetail],
+                        photo: Optional[JmPhotoDetail],
+                        filename_rule: Optional[str], suffix: Optional[str], base_dir: Optional[str],
+                        dir_rule_dict: Optional[dict]
+                        ):
+        """
+        根据规则计算一个文件的全路径
+
+        参数 dir_rule_dict 优先级最高，
+        如果 dir_rule_dict 不为空，优先用 dir_rule_dict
+        否则使用 base_dir + filename_rule + suffix
+
+        当album为空时，自动复制为photo.from_album，防止底层dir_rule的dsl包含Axx报错
+        """
+        if album is None:
+            album = photo.from_album
+        filepath: str
+        base_dir: str
+        if dir_rule_dict is not None:
+            dir_rule = DirRule(**dir_rule_dict)
+            filepath = dir_rule.apply_rule_to_path(album, photo)
+            base_dir = os.path.dirname(filepath)
+        else:
+            base_dir = base_dir or os.getcwd()
+            filepath = os.path.join(base_dir, DirRule.apply_rule_to_filename(album, photo, filename_rule) + fix_suffix(suffix))
+
+        mkdir_if_not_exists(base_dir)
+        return fix_filepath(filepath)
+
 
 class JmLoginPlugin(JmOptionPlugin):
     """
@@ -124,7 +169,6 @@ class JmLoginPlugin(JmOptionPlugin):
 
         cookies = dict(client['cookies'])
         self.option.update_cookies(cookies)
-        JmModuleConfig.APP_COOKIES = cookies
 
         self.log('登录成功')
 
@@ -218,7 +262,7 @@ class UsageLogPlugin(JmOptionPlugin):
             ])
             self.log(msg, topic='log')
 
-            if enable_warning is True:
+            if enable_warning:
                 # 警告
                 warning()
 
@@ -274,22 +318,33 @@ class FindUpdatePlugin(JmOptionPlugin):
 
 
 class ZipPlugin(JmOptionPlugin):
+    """
+    感谢zip加密功能的贡献者:
+        - AXIS5 a.k.a AXIS5Hacker (https://github.com/hect0x7/JMComic-Crawler-Python/pull/375)
+    """
+
     plugin_key = 'zip'
 
     # noinspection PyAttributeOutsideInit
     def invoke(self,
-               album: JmAlbumDetail,
                downloader,
+               album: JmAlbumDetail = None,
+               photo: JmPhotoDetail = None,
                delete_original_file=False,
-               level='photo',
+               level=None,
                filename_rule='Ptitle',
                suffix='zip',
-               zip_dir='./'
+               zip_dir='./',
+               dir_rule=None,
+               encrypt=None,
                ) -> None:
 
         from .jm_downloader import JmDownloader
         downloader: JmDownloader
         self.downloader = downloader
+        # level 自动推导：有 album 则合并打包，只有 photo 则单章打包
+        if level is None:
+            level = 'album' if album is not None else 'photo'
         self.level = level
         self.delete_original_file = delete_original_file
 
@@ -298,23 +353,33 @@ class ZipPlugin(JmOptionPlugin):
         mkdir_if_not_exists(zip_dir)
 
         path_to_delete = []
-        photo_dict = downloader.download_success_dict[album]
+        photo_dict = self.get_downloaded_photo(downloader, album, photo)
 
         if level == 'album':
-            zip_path = self.get_zip_path(album, None, filename_rule, suffix, zip_dir)
-            self.zip_album(album, photo_dict, zip_path, path_to_delete)
+            zip_path = self.decide_filepath(album, None, filename_rule, suffix, zip_dir, dir_rule)
+            self.zip_album(album, photo_dict, zip_path, path_to_delete, encrypt)
+            downloader.record_export_filepath(album, zip_path)
 
         elif level == 'photo':
             for photo, image_list in photo_dict.items():
-                zip_path = self.get_zip_path(None, photo, filename_rule, suffix, zip_dir)
-                self.zip_photo(photo, image_list, zip_path, path_to_delete)
+                zip_path = self.decide_filepath(photo.from_album, photo, filename_rule, suffix, zip_dir, dir_rule)
+                self.zip_photo(photo, image_list, zip_path, path_to_delete, encrypt)
+                downloader.record_export_filepath(photo, zip_path)
 
         else:
             ExceptionTool.raises(f'Not Implemented Zip Level: {level}')
 
         self.after_zip(path_to_delete)
 
-    def zip_photo(self, photo, image_list: list, zip_path: str, path_to_delete):
+    # noinspection PyMethodMayBeStatic
+    def get_downloaded_photo(self, downloader, album, photo):
+        return (
+            downloader.download_success_dict[album]
+            if album is not None  # after_album
+            else downloader.download_success_dict[photo.from_album]  # after_photo
+        )
+
+    def zip_photo(self, photo, image_list: list, zip_path: str, path_to_delete, encrypt_dict):
         """
         压缩photo文件夹
         """
@@ -322,24 +387,28 @@ class ZipPlugin(JmOptionPlugin):
             if len(image_list) == 0 \
             else os.path.dirname(image_list[0][0])
 
-        from common import backup_dir_to_zip
-        backup_dir_to_zip(photo_dir, zip_path)
+        with self.open_zip_file(zip_path, encrypt_dict) as f:
+            for file in files_of_dir(photo_dir):
+                abspath = os.path.join(photo_dir, file)
+                relpath = os.path.relpath(abspath, photo_dir)
+                f.write(abspath, relpath)
 
-        self.log(f'压缩章节[{photo.photo_id}]成功 → {zip_path}', 'finish')
+        # 打印结果
+        self.log(f'{photo.alias_cn()}压缩成功！'
+                 f'[{photo}] → [{zip_path}]', 'finish')
         path_to_delete.append(self.unified_path(photo_dir))
 
     @staticmethod
     def unified_path(f):
         return fix_filepath(f, os.path.isdir(f))
 
-    def zip_album(self, album, photo_dict: dict, zip_path, path_to_delete):
+    def zip_album(self, album, photo_dict: dict, zip_path, path_to_delete, encrypt_dict):
         """
         压缩album文件夹
         """
 
         album_dir = self.option.dir_rule.decide_album_root_dir(album)
-        import zipfile
-        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as f:
+        with self.open_zip_file(zip_path, encrypt_dict) as f:
             for photo in photo_dict.keys():
                 # 定位到章节所在文件夹
                 photo_dir = self.unified_path(self.option.decide_image_save_dir(photo))
@@ -349,7 +418,9 @@ class ZipPlugin(JmOptionPlugin):
                     abspath = os.path.join(photo_dir, file)
                     relpath = os.path.relpath(abspath, album_dir)
                     f.write(abspath, relpath)
-        self.log(f'压缩本子[{album.album_id}]成功 → {zip_path}', 'finish')
+        # 打印结果
+        self.log(f'{album.alias_cn()}压缩成功！'
+                 f'[{album}] → [{zip_path}]', 'finish')
 
     def after_zip(self, path_to_delete: List[str]):
         # 删除所有原文件
@@ -364,16 +435,65 @@ class ZipPlugin(JmOptionPlugin):
         self.execute_deletion(dirs)
 
     # noinspection PyMethodMayBeStatic
-    def get_zip_path(self, album, photo, filename_rule, suffix, zip_dir):
+    @classmethod
+    def generate_random_str(cls, random_length) -> str:
         """
-        计算zip文件的路径
+        自动生成随机字符密码，长度由randomlength指定
         """
-        filename = DirRule.apply_rule_directly(album, photo, filename_rule)
-        from os.path import join
-        return join(
-            zip_dir,
-            filename + fix_suffix(suffix),
-        )
+        import random
+
+        random_str = ''
+        base_str = r'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/='
+        base_length = len(base_str) - 1
+        for _ in range(random_length):
+            random_str += base_str[random.randint(0, base_length)]
+        return random_str
+
+    def open_zip_file(self, zip_path: str, encrypt_dict: Optional[dict]):
+        if encrypt_dict is None:
+            import zipfile
+            return zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED)
+
+        password, is_random = self.decide_password(encrypt_dict, zip_path)
+        if encrypt_dict.get('impl', '') == '7z':
+            try:
+                # noinspection PyUnresolvedReferences
+                import py7zr
+            except ImportError:
+                self.warning_lib_not_install('py7zr', True)
+
+            # noinspection PyUnboundLocalVariable
+            filters = [{'id': py7zr.FILTER_COPY}]
+            return py7zr.SevenZipFile(zip_path, mode='w', password=password, filters=filters, header_encryption=True)
+        else:
+            try:
+                # noinspection PyUnresolvedReferences
+                import pyzipper
+            except ImportError:
+                self.warning_lib_not_install('pyzipper', True)
+
+            # noinspection PyUnboundLocalVariable
+            aes_zip_file = pyzipper.AESZipFile(zip_path, "w", pyzipper.ZIP_DEFLATED)
+            aes_zip_file.setencryption(pyzipper.WZ_AES, nbits=128)
+            password_bytes = str.encode(password)
+            aes_zip_file.setpassword(password_bytes)
+            if is_random:
+                aes_zip_file.comment = password_bytes
+            return aes_zip_file
+
+    def decide_password(self, encrypt_dict: dict, zip_path: str):
+        encrypt_type = encrypt_dict.get('type', '')
+        is_random = False
+
+        if encrypt_type == 'random':
+            is_random = True
+            password = self.generate_random_str(48)
+            self.log(f'生成随机密码: [{password}] → [{zip_path}]', 'encrypt')
+        else:
+            password = str(encrypt_dict['password'])
+            self.log(f'使用指定密码: [{password}] → [{zip_path}]', 'encrypt')
+
+        return password, is_random
 
 
 class ClientProxyPlugin(JmOptionPlugin):
@@ -451,19 +571,466 @@ class SendQQEmailPlugin(JmOptionPlugin):
 class LogTopicFilterPlugin(JmOptionPlugin):
     plugin_key = 'log_topic_filter'
 
+    import logging
+
+    class TopicFilter(logging.Filter):
+        def __init__(self, whitelist):
+            super().__init__()
+            self.whitelist = whitelist
+
+        def filter(self, record):
+            topic = getattr(record, 'topic', None)
+            if self.whitelist is not None and topic is not None and topic not in self.whitelist:
+                return False
+            return True
+
     def invoke(self, whitelist) -> None:
         if whitelist is not None:
             whitelist = set(whitelist)
 
-        old_jm_log = JmModuleConfig.EXECUTOR_LOG
+        from jmcomic import jm_logger
 
-        def new_jm_log(topic, msg):
-            if whitelist is not None and topic not in whitelist:
-                return
+        # 删除旧的同类 filter 避免重复
+        jm_logger.filters = [f for f in jm_logger.filters if not isinstance(f, LogTopicFilterPlugin.TopicFilter)]
+        jm_logger.addFilter(LogTopicFilterPlugin.TopicFilter(whitelist))
 
-            old_jm_log(topic, msg)
 
-        JmModuleConfig.EXECUTOR_LOG = new_jm_log
+# noinspection attribute-outside-init
+class ProgressDownloader(JmDownloader):
+    progress_console = None
+    progress_log_lines = deque(maxlen=6)
+    active_progresses = set()
+    progress_ui_lock = RLock()
+
+    @staticmethod
+    def display_id(entity_id):
+        entity_id = str(entity_id)
+        return entity_id if entity_id.upper().startswith('JM') else f'JM{entity_id}'
+
+    @classmethod
+    def get_progress_console(cls):
+        if cls.progress_console is None:
+            from rich.console import Console
+            cls.progress_console = Console()
+        return cls.progress_console
+
+    @classmethod
+    def reset_progress_logs(cls):
+        with cls.progress_ui_lock:
+            cls.progress_log_lines.clear()
+
+    @classmethod
+    def configure_progress_log_lines(cls, max_lines):
+        with cls.progress_ui_lock:
+            cls.progress_log_lines = deque(maxlen=max_lines)
+
+    @classmethod
+    def append_progress_log(cls, message):
+        with cls.progress_ui_lock:
+            cls.progress_log_lines.append(message)
+            progresses = tuple(cls.active_progresses)
+
+        for progress in progresses:
+            try:
+                progress.refresh()
+            except Exception:
+                pass
+
+    @classmethod
+    def register_progress(cls, progress):
+        if progress.console.is_interactive:
+            with cls.progress_ui_lock:
+                cls.active_progresses.add(progress)
+
+    @classmethod
+    def unregister_progress(cls, progress):
+        with cls.progress_ui_lock:
+            cls.active_progresses.discard(progress)
+
+    @classmethod
+    def build_log_panel(cls):
+        from rich.console import Group
+        from rich.panel import Panel
+        from rich.text import Text
+
+        with cls.progress_ui_lock:
+            lines = list(cls.progress_log_lines)
+            max_lines = cls.progress_log_lines.maxlen
+
+        render_lines = [
+            Text(line, overflow='ellipsis', no_wrap=True)
+            for line in lines
+        ]
+        render_lines.extend(Text('') for _ in range(max_lines - len(render_lines)))
+        return Panel(
+            Group(*render_lines),
+            title='[bold cyan]JMComic Logs[/bold cyan]',
+            border_style='cyan',
+            height=max_lines + 2,
+        )
+
+    @classmethod
+    def new_rich_progress(cls, console):
+        from rich.progress import (
+            BarColumn,
+            MofNCompleteColumn,
+            Progress,
+            SpinnerColumn,
+            TaskProgressColumn,
+            TextColumn,
+            TimeElapsedColumn,
+        )
+
+        class ProgressWithLogs(Progress):
+            def get_renderables(self):
+                yield cls.build_log_panel()
+                yield from super().get_renderables()
+
+        return ProgressWithLogs(
+            SpinnerColumn(style='bright_cyan'),
+            TextColumn('{task.description}'),
+            BarColumn(
+                bar_width=28,
+                style='grey37',
+                complete_style='bright_cyan',
+                finished_style='bright_green',
+            ),
+            MofNCompleteColumn(),
+            TaskProgressColumn(),
+            TimeElapsedColumn(),
+            console=console,
+            auto_refresh=False,
+            disable=not console.is_interactive,
+        )
+
+    def refresh_progress(self):
+        if self.progress.console.is_interactive:
+            self.progress.refresh()
+
+    def print_non_interactive_summary(self, photo_id=None):
+        if self.progress.console.is_interactive:
+            return
+
+        if photo_id is not None:
+            done = self.chapter_done[photo_id]
+            total = self.chapter_total[photo_id]
+            succeeded = done == total
+            icon = '✓' if succeeded else '⚠'
+            status = '下载完成' if succeeded else '下载结束'
+            chapter_name = f'章节-{ProgressDownloader.display_id(photo_id)}'
+            self.progress.console.print(
+                f'{icon} {status}：{chapter_name}，图片 {done}/{total}'
+            )
+            return
+
+        image_done = sum(self.chapter_done.values())
+        image_total = sum(self.chapter_total.values())
+        succeeded = self.album_done == self.album_total and image_done == image_total
+        icon = '✓' if succeeded else '⚠'
+        status = '下载完成' if succeeded else '下载结束'
+        album_name = f'本子-{ProgressDownloader.display_id(self.album_id)}'
+        self.progress.console.print(
+            f'{icon} {status}：{album_name}，章节 {self.album_done}/{self.album_total}，'
+            f'图片 {image_done}/{image_total}'
+        )
+
+    def before_album(self, album):
+        super().before_album(album)
+        self.start_progress(len(album), album.id)
+
+    def start_progress(self, album_total=None, album_id=None):
+        from threading import Lock
+
+        self.progress_lock = Lock()
+        self.album_total = album_total
+        self.album_id = album_id
+        self.album_done = 0
+        self.chapter_done = {}
+        self.chapter_total = {}
+        self.chapter_tasks = {}
+        console = self.get_progress_console()
+        self.progress = self.new_rich_progress(console)
+        self.progress.start()
+        self.register_progress(self.progress)
+        self.album_task = None
+        if album_total is not None:
+            self.album_task = self.progress.add_task(
+                f'[bold magenta]本子-{self.display_id(album_id)}[/bold magenta]',
+                total=album_total,
+            )
+        self.refresh_progress()
+
+    def before_photo(self, photo):
+        super().before_photo(photo)
+        if getattr(self, 'progress', None) is None:
+            self.start_progress()
+        with self.progress_lock:
+            self.chapter_done[photo.id] = 0
+            self.chapter_total[photo.id] = len(photo)
+            self.chapter_tasks[photo.id] = self.progress.add_task(
+                f'[cyan]章节-{self.display_id(photo.id)}[/cyan]',
+                total=len(photo),
+            )
+            self.refresh_progress()
+
+    def after_image(self, image, img_save_path):
+        super().after_image(image, img_save_path)
+        photo_id = image.from_photo.id
+        with self.progress_lock:
+            self.chapter_done[photo_id] += 1
+            self.progress.advance(self.chapter_tasks[photo_id])
+            self.refresh_progress()
+
+    def after_photo(self, photo):
+        super().after_photo(photo)
+        with self.progress_lock:
+            done = self.chapter_done[photo.id]
+            succeeded = done == len(photo)
+            color = 'bold green' if succeeded else 'bold yellow'
+            icon = '✓' if succeeded else '⚠'
+            self.progress.update(
+                self.chapter_tasks[photo.id],
+                description=f'[{color}]{icon} 章节-{self.display_id(photo.id)}[/{color}]',
+            )
+            if succeeded:
+                self.album_done += 1
+                if self.album_task is not None:
+                    self.progress.advance(self.album_task)
+            self.refresh_progress()
+            if self.album_total is None:
+                self.print_non_interactive_summary(photo.id)
+
+    def after_album(self, album):
+        super().after_album(album)
+        with self.progress_lock:
+            succeeded = self.album_done == len(album)
+            color = 'bold green' if succeeded else 'bold yellow'
+            icon = '✓' if succeeded else '⚠'
+            self.progress.update(
+                self.album_task,
+                description=f'[{color}]{icon} 本子-{self.display_id(self.album_id)}[/{color}]',
+            )
+            self.refresh_progress()
+            self.print_non_interactive_summary()
+        self.stop_progress()
+
+    def stop_progress(self):
+        progress = getattr(self, 'progress', None)
+        if progress is None:
+            return
+        self.unregister_progress(progress)
+        if progress.console.is_interactive:
+            progress.stop()
+        self.progress = None
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.stop_progress()
+        return super().__exit__(exc_type, exc_val, exc_tb)
+
+# noinspection attribute-outside-init
+class AsyncProgressDownloader(JmAsyncDownloader):
+
+    def start_progress(self, album_total=None, album_id=None):
+        from threading import Lock
+
+        self.progress_lock = Lock()
+        self.album_total = album_total
+        self.album_id = album_id
+        self.album_done = 0
+        self.chapter_done = {}
+        self.chapter_total = {}
+        self.chapter_tasks = {}
+        console = ProgressDownloader.get_progress_console()
+        self.progress = ProgressDownloader.new_rich_progress(console)
+        self.progress.start()
+        ProgressDownloader.register_progress(self.progress)
+        self.album_task = None
+        if album_total is not None:
+            self.album_task = self.progress.add_task(
+                f'[bold magenta]本子-{ProgressDownloader.display_id(album_id)}[/bold magenta]',
+                total=album_total,
+            )
+        ProgressDownloader.refresh_progress(self)
+
+    async def before_album(self, album):
+        await super().before_album(album)
+        self.start_progress(len(album), album.id)
+
+    async def before_photo(self, photo):
+        await super().before_photo(photo)
+        if getattr(self, 'progress', None) is None:
+            self.start_progress()
+        with self.progress_lock:
+            self.chapter_done[photo.id] = 0
+            self.chapter_total[photo.id] = len(photo)
+            self.chapter_tasks[photo.id] = self.progress.add_task(
+                f'[cyan]章节-{ProgressDownloader.display_id(photo.id)}[/cyan]',
+                total=len(photo),
+            )
+            ProgressDownloader.refresh_progress(self)
+
+    async def after_image(self, image, img_save_path):
+        await super().after_image(image, img_save_path)
+        photo_id = image.from_photo.id
+        with self.progress_lock:
+            self.chapter_done[photo_id] += 1
+            self.progress.advance(self.chapter_tasks[photo_id])
+            ProgressDownloader.refresh_progress(self)
+
+    async def after_photo(self, photo):
+        await super().after_photo(photo)
+        with self.progress_lock:
+            done = self.chapter_done[photo.id]
+            succeeded = done == len(photo)
+            color = 'bold green' if succeeded else 'bold yellow'
+            icon = '✓' if succeeded else '⚠'
+            self.progress.update(
+                self.chapter_tasks[photo.id],
+                description=f'[{color}]{icon} 章节-{ProgressDownloader.display_id(photo.id)}[/{color}]',
+            )
+            if succeeded:
+                self.album_done += 1
+                if self.album_task is not None:
+                    self.progress.advance(self.album_task)
+            ProgressDownloader.refresh_progress(self)
+            if self.album_total is None:
+                ProgressDownloader.print_non_interactive_summary(self, photo.id)
+
+    async def after_album(self, album):
+        await super().after_album(album)
+        with self.progress_lock:
+            succeeded = self.album_done == len(album)
+            color = 'bold green' if succeeded else 'bold yellow'
+            icon = '✓' if succeeded else '⚠'
+            self.progress.update(
+                self.album_task,
+                description=f'[{color}]{icon} 本子-{ProgressDownloader.display_id(self.album_id)}[/{color}]',
+            )
+            ProgressDownloader.refresh_progress(self)
+            ProgressDownloader.print_non_interactive_summary(self)
+        self.stop_progress()
+
+    def stop_progress(self):
+        progress = getattr(self, 'progress', None)
+        if progress is None:
+            return
+        ProgressDownloader.unregister_progress(progress)
+        if progress.console.is_interactive:
+            progress.stop()
+        self.progress = None
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        self.stop_progress()
+        return await super().__aexit__(exc_type, exc_val, exc_tb)
+
+
+class DownloadProgressPlugin(JmOptionPlugin):
+    plugin_key = 'download_progress'
+    log_file = 'jmcomic-download.log'
+
+    @staticmethod
+    def cli_no_progress_notice():
+        if not get_jm_task_context().get('cli_no_progress'):
+            return ''
+
+        return (
+            '\n[bold yellow]⚠ 检测到命令行参数 --no-progress，'
+            '但是当前 Option 已配置 download_progress 插件，因此未关闭进度条。[/bold yellow]'
+        )
+
+    @classmethod
+    def build(cls, option):
+        plugin = cls(option)
+        try:
+            import rich
+        except ImportError:
+            plugin.warning_lib_not_install('rich')
+        return plugin
+
+    def redirect_log_to_file(self, log_file=None):
+        import logging
+        from pathlib import Path
+        from .jm_config import jm_logger
+
+        class ProgressLogHandler(logging.Handler):
+            def emit(self, record):
+                try:
+                    ProgressDownloader.append_progress_log(self.format(record))
+                except Exception:
+                    self.handleError(record)
+
+        log_path = Path(log_file or self.log_file).resolve()
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        formatter = logging.Formatter(
+            '%(asctime)s [%(threadName)s] [%(topic)s] '
+            '%(message)s'
+        )
+        file_handler = logging.FileHandler(log_path, encoding='utf-8')
+        file_handler.setFormatter(formatter)
+
+        for old_handler in jm_logger.handlers[:]:
+            jm_logger.removeHandler(old_handler)
+
+        ProgressDownloader.reset_progress_logs()
+        jm_logger.addHandler(file_handler)
+        if ProgressDownloader.get_progress_console().is_interactive:
+            progress_handler = ProgressLogHandler()
+            progress_handler.setFormatter(formatter)
+            jm_logger.addHandler(progress_handler)
+        jm_logger.setLevel(logging.INFO)
+        jm_logger.propagate = False
+        return log_path
+
+    @staticmethod
+    def print_non_interactive_notice(console, log_path):
+        from rich.panel import Panel
+
+        console.print(Panel.fit(
+            '[bold green]✓ 下载进度插件已启用[/bold green]'
+            f'{DownloadProgressPlugin.cli_no_progress_notice()}\n\n'
+            '[cyan]显示模式[/cyan]：完成后汇总\n'
+            '[cyan]动态进度[/cyan]：请在 Terminal / PowerShell 中运行\n\n'
+            '[yellow]详细日志[/yellow]\n'
+            f'{log_path}',
+            title='[bold magenta]JMComic Progress[/bold magenta]',
+            border_style='bright_blue',
+        ))
+
+    def invoke(self,
+               log_file='jmcomic-download.log',
+               terminal_log_lines=6,
+               ):
+        from rich.panel import Panel
+
+        self.require_param(
+            isinstance(terminal_log_lines, int)
+            and not isinstance(terminal_log_lines, bool)
+            and terminal_log_lines > 0,
+            'terminal_log_lines 必须是大于 0 的整数',
+        )
+        ProgressDownloader.configure_progress_log_lines(terminal_log_lines)
+        self.log_path = self.redirect_log_to_file(log_file)
+        ProgressDownloader.use()
+        AsyncProgressDownloader.use()
+        self.log('已将默认 Downloader 替换为 ProgressDownloader')
+        self.log('已将默认 Async Downloader 替换为 AsyncProgressDownloader')
+        self.log(f'普通日志只写入文件: {self.log_path}')
+        console = ProgressDownloader.get_progress_console()
+        if console.is_interactive:
+            self.log('当前为交互终端，显示本子、章节两级彩色动态进度')
+            console.print(Panel.fit(
+                '[bold green]✓ 彩色下载进度插件已启用[/bold green]'
+                f'{self.cli_no_progress_notice()}\n'
+                '[cyan]Sync[/cyan]：ProgressDownloader\n'
+                '[cyan]Async[/cyan]：AsyncProgressDownloader\n'
+                f'[yellow]详细日志[/yellow]：{self.log_path}\n'
+                '[dim]终端只显示进度，普通日志不会刷屏[/dim]',
+                title='[bold magenta]JMComic Progress[/bold magenta]',
+                border_style='bright_blue',
+            ))
+        else:
+            self.log('当前不是交互终端，关闭动态进度，只在下载结束后输出汇总')
+            self.print_non_interactive_notice(console, self.log_path)
 
 
 class AutoSetBrowserCookiesPlugin(JmOptionPlugin):
@@ -556,7 +1123,7 @@ class FavoriteFolderExportPlugin(JmOptionPlugin):
         # 一个收藏夹一个线程，导出收藏夹数据到文件
         multi_thread_launcher(
             iter_objs=folders.items(),
-            apply_each_obj_func=self.handle_folder,
+            apply_each_obj_func=bind_jm_task_context(self.handle_folder),
         )
 
         if not self.zip_enable:
@@ -641,95 +1208,6 @@ class FavoriteFolderExportPlugin(JmOptionPlugin):
         self.execute_multi_line_cmd(cmd_list)
 
 
-class ConvertJpgToPdfPlugin(JmOptionPlugin):
-    plugin_key = 'j2p'
-
-    def check_image_suffix_is_valid(self, std_suffix):
-        """
-        检查option配置的图片后缀转换，目前限制使用Magick时只能搭配jpg
-        暂不探究Magick是否支持更多图片格式
-        """
-        cur_suffix: Optional[str] = self.option.download.image.suffix
-
-        ExceptionTool.require_true(
-            cur_suffix is not None and cur_suffix.endswith(std_suffix),
-            '请把图片的后缀转换配置为jpg，不然无法使用Magick！'
-            f'（当前配置是[{cur_suffix}]）\n'
-            f'配置模板如下: \n'
-            f'```\n'
-            f'download:\n'
-            f'  image:\n'
-            f'    suffix: {std_suffix} # 当前配置是{cur_suffix}\n'
-            f'```'
-        )
-
-    def invoke(self,
-               photo: JmPhotoDetail,
-               downloader=None,
-               pdf_dir=None,
-               filename_rule='Pid',
-               quality=100,
-               delete_original_file=False,
-               override_cmd=None,
-               override_jpg=None,
-               **kwargs,
-               ):
-        self.delete_original_file = delete_original_file
-
-        # 检查图片后缀配置
-        suffix = override_jpg or '.jpg'
-        self.check_image_suffix_is_valid(suffix)
-
-        # 处理文件夹配置
-        filename = DirRule.apply_rule_directly(None, photo, filename_rule)
-        photo_dir = self.option.decide_image_save_dir(photo)
-
-        # 处理生成的pdf文件的路径
-        if pdf_dir is None:
-            pdf_dir = photo_dir
-        else:
-            pdf_dir = fix_filepath(pdf_dir, True)
-            mkdir_if_not_exists(pdf_dir)
-
-        pdf_filepath = os.path.join(pdf_dir, f'{filename}.pdf')
-
-        # 生成命令
-        def generate_cmd():
-            return (
-                    override_cmd or
-                    'magick convert -quality {quality} "{photo_dir}*{suffix}" "{pdf_filepath}"'
-            ).format(
-                quality=quality,
-                photo_dir=photo_dir,
-                suffix=suffix,
-                pdf_filepath=pdf_filepath,
-            )
-
-        cmd = generate_cmd()
-        self.log(f'Execute Command: [{cmd}]')
-        code = self.execute_cmd(cmd)
-
-        ExceptionTool.require_true(
-            code == 0,
-            'jpg图片合并为pdf失败！'
-            '请确认你是否安装了magick，安装网站: [https://www.imagemagick.org/]',
-        )
-
-        self.log(f'Convert Successfully: JM{photo.id} → {pdf_filepath}')
-
-        if downloader is not None:
-            from .jm_downloader import JmDownloader
-            downloader: JmDownloader
-
-            paths = [
-                path
-                for path, image in downloader.download_success_dict[photo.from_album][photo]
-            ]
-
-            paths.append(self.option.decide_image_save_dir(photo, ensure_exists=False))
-            self.execute_deletion(paths)
-
-
 class Img2pdfPlugin(JmOptionPlugin):
     plugin_key = 'img2pdf'
 
@@ -739,7 +1217,9 @@ class Img2pdfPlugin(JmOptionPlugin):
                downloader=None,
                pdf_dir=None,
                filename_rule='Pid',
+               dir_rule=None,
                delete_original_file=False,
+               encrypt=None,
                **kwargs,
                ):
         if photo is None and album is None:
@@ -754,23 +1234,28 @@ class Img2pdfPlugin(JmOptionPlugin):
         self.delete_original_file = delete_original_file
 
         # 处理生成的pdf文件的路径
-        pdf_dir = self.ensure_make_pdf_dir(pdf_dir)
-
-        # 处理pdf文件名
-        filename = DirRule.apply_rule_directly(album, photo, filename_rule)
-
-        # pdf路径
-        pdf_filepath = os.path.join(pdf_dir, f'{filename}.pdf')
+        pdf_filepath = self.decide_filepath(album, photo, filename_rule, 'pdf', pdf_dir, dir_rule)
 
         # 调用 img2pdf 把 photo_dir 下的所有图片转为pdf
-        img_path_ls, img_dir_ls = self.write_img_2_pdf(pdf_filepath, album, photo)
-        self.log(f'Convert Successfully: JM{album or photo} → {pdf_filepath}')
+        result = self.write_img_2_pdf(pdf_filepath, album, photo, encrypt)
+        if not result:
+            return
+        img_path_ls, img_dir_ls = result
+
+        # noinspection PyTypeChecker
+        detail: DetailEntity = album or photo
+        if downloader is not None:
+            downloader.record_export_filepath(detail, pdf_filepath)
+
+        # 打印结果
+        self.log(f'{detail.alias_cn()}合并PDF成功！'
+                 f'[{detail}] → [{pdf_filepath}]', 'finish')
 
         # 执行删除
         img_path_ls += img_dir_ls
         self.execute_deletion(img_path_ls)
 
-    def write_img_2_pdf(self, pdf_filepath, album: JmAlbumDetail, photo: JmPhotoDetail):
+    def write_img_2_pdf(self, pdf_filepath, album: JmAlbumDetail, photo: JmPhotoDetail, encrypt):
         import img2pdf
 
         if album is None:
@@ -786,17 +1271,125 @@ class Img2pdfPlugin(JmOptionPlugin):
                 continue
             img_path_ls += imgs
 
+        if len(img_path_ls) == 0:
+            self.log(f'所有文件夹都不存在图片，无法生成pdf：{img_dir_ls}', 'error')
+            return
+
         with open(pdf_filepath, 'wb') as f:
             f.write(img2pdf.convert(img_path_ls))
 
+        if encrypt:
+            self.encrypt_pdf(pdf_filepath, encrypt)
+
         return img_path_ls, img_dir_ls
 
-    @staticmethod
-    def ensure_make_pdf_dir(pdf_dir: str):
-        pdf_dir = pdf_dir or os.getcwd()
-        pdf_dir = fix_filepath(pdf_dir, True)
-        mkdir_if_not_exists(pdf_dir)
-        return pdf_dir
+    def encrypt_pdf(self, pdf_filepath: str, encrypt: dict):
+        try:
+            import pikepdf
+        except ImportError:
+            self.warning_lib_not_install('pikepdf')
+            return
+
+        password = str(encrypt.get('password', ''))
+        with pikepdf.open(pdf_filepath, allow_overwriting_input=True) as pdf:
+            pdf.save(pdf_filepath, encryption=pikepdf.Encryption(user=password, owner=password))
+
+
+class LongImgPlugin(JmOptionPlugin):
+    plugin_key = 'long_img'
+
+    def invoke(self,
+               photo: JmPhotoDetail = None,
+               album: JmAlbumDetail = None,
+               downloader=None,
+               img_dir=None,
+               filename_rule='Pid',
+               delete_original_file=False,
+               dir_rule=None,
+               **kwargs,
+               ):
+        if photo is None and album is None:
+            jm_log('wrong_usage', 'long_img必须运行在after_photo或after_album时')
+
+        try:
+            from PIL import Image
+        except ImportError:
+            self.warning_lib_not_install('PIL')
+            return
+
+        self.delete_original_file = delete_original_file
+
+        # 处理生成的长图文件的路径
+        long_img_path = self.decide_filepath(album, photo, filename_rule, 'png', img_dir, dir_rule)
+
+        # 调用 PIL 把 photo_dir 下的所有图片合并为长图
+        img_path_ls = self.write_img_2_long_img(long_img_path, album, photo)
+        if not img_path_ls:
+            return
+        # noinspection PyTypeChecker
+        detail: DetailEntity = album or photo
+        if downloader is not None:
+            downloader.record_export_filepath(detail, long_img_path)
+
+        # 打印结果
+        self.log(f'{detail.alias_cn()}合并长图成功！'
+                 f'[{detail}] → [{long_img_path}]', 'finish')
+
+        # 执行删除
+        self.execute_deletion(img_path_ls)
+
+    def write_img_2_long_img(self, long_img_path, album: JmAlbumDetail, photo: JmPhotoDetail) -> Optional[List[str]]:
+        import itertools
+        from PIL import Image
+
+        if album is None:
+            img_dir_items = [self.option.decide_image_save_dir(photo)]
+        else:
+            img_dir_items = [self.option.decide_image_save_dir(photo) for photo in album]
+
+        img_paths = itertools.chain(*map(files_of_dir, img_dir_items))
+        img_paths = list(filter(lambda x: not x.startswith('.'), img_paths))  # 过滤系统文件
+
+        if not img_paths:
+            self.log(f'所有文件夹都不存在图片，无法生成long_img：{img_paths}', 'error')
+            return
+
+        images = self.open_images(img_paths)
+
+        try:
+            resample_method = Image.Resampling.LANCZOS
+        except AttributeError:
+            resample_method = Image.LANCZOS
+
+        min_img_width = min(img.width for img in images)
+        total_height = 0
+        for i, img in enumerate(images):
+            if img.width > min_img_width:
+                images[i] = img.resize((min_img_width, int(img.height * min_img_width / img.width)),
+                                       resample=resample_method)
+            total_height += images[i].height
+
+        long_img = Image.new('RGB', (min_img_width, total_height))
+        y_offset = 0
+        for img in images:
+            long_img.paste(img, (0, y_offset))
+            y_offset += img.height
+
+        long_img.save(long_img_path)
+        for img in images:
+            img.close()
+
+        return img_paths
+
+    def open_images(self, img_paths: List[str]):
+        images = []
+        for img_path in img_paths:
+            try:
+                img = Image.open(img_path)
+                images.append(img)
+            except IOError as e:
+                self.log(f"Failed to open image {img_path}: {e}", 'error')
+        return images
 
 
 class JmServerPlugin(JmOptionPlugin):
@@ -847,27 +1440,41 @@ class JmServerPlugin(JmOptionPlugin):
             base_run_kwargs.update(run)
             run = base_run_kwargs
 
-        if self.running is True:
+        if self.running:
             return
 
         with self.run_server_lock:
-            if self.running is True:
+            if self.running:
                 return
 
-            # 服务器的代码位于一个独立库：plugin_jm_server，需要独立安装
-            # 源代码仓库：https://github.com/hect0x7/plugin-jm-server
+            # 服务器的代码位于独立库 jm-view-server，需要独立安装
+            # 源代码仓库：https://github.com/hect0x7/jm-view-server
             try:
-                import plugin_jm_server
-                self.log(f'当前使用plugin_jm_server版本: {plugin_jm_server.__version__}')
-            except ImportError:
-                self.warning_lib_not_install('plugin_jm_server')
-                return
+                # noinspection PyUnresolvedReferences
+                import jm_view_server as jm_server_lib
+            except ModuleNotFoundError as e:
+                if e.name != 'jm_view_server':
+                    raise
+
+                try:
+                    # 兼容尚未迁移的 plugin_jm_server <= 0.2.3
+                    # noinspection PyUnresolvedReferences
+                    import plugin_jm_server as jm_server_lib
+                except ModuleNotFoundError as legacy_error:
+                    if legacy_error.name != 'plugin_jm_server':
+                        raise
+                    self.warning_lib_not_install('jm-view-server')
+                    return
+
+                self.log('检测到旧包 plugin_jm_server，建议升级到 jm-view-server', 'warning')
+
+            self.log(f'当前使用 jm-view-server 版本: {jm_server_lib.__version__}')
 
             # 核心函数，启动服务器，会阻塞当前线程
             def blocking_run_server():
                 self.server_thread = current_thread()
                 self.enter_wait_list()
-                server = plugin_jm_server.JmServer(base_dir, password, **kwargs)
+                server = jm_server_lib.JmServer(base_dir, password, **kwargs)
                 # run方法会阻塞当前线程直到flask退出
                 server.run(**run)
 
@@ -966,7 +1573,7 @@ class SubscribeAlbumUpdatePlugin(JmOptionPlugin):
                 self.log('Exception happened: ' + str(e), 'check_update.error')
                 continue
 
-            if has_update is False:
+            if not has_update:
                 continue
 
             self.log(f'album={album_id}，发现新章节: {photo_new_list}，准备开始下载')
@@ -1117,3 +1724,124 @@ class ReplacePathStringPlugin(JmOptionPlugin):
             return original_path
 
         self.option.decide_image_save_dir = new_decide_dir
+
+
+class AdvancedRetryPlugin(JmOptionPlugin):
+    plugin_key = 'advanced_retry'
+
+    def __init__(self, option: JmOption):
+        super().__init__(option)
+        self.retry_config = None
+
+    def invoke(self,
+               retry_config,
+               **kwargs):
+        self.require_param(isinstance(retry_config, dict), '必须配置retry_config为dict')
+        self.retry_config = retry_config
+
+        new_jm_client: Callable = self.option.new_jm_client
+
+        def hook_new_jm_client(*args, **kwargs):
+            return new_jm_client(*args, **kwargs, domain_retry_strategy=self)
+
+        self.option.new_jm_client = hook_new_jm_client
+
+    def __call__(self, client: AbstractJmClient, *args, **kwargs):
+        if args:
+            return self.request_with_retry(client, *args, **kwargs)
+        # init
+        from threading import Lock
+        client.domain_req_failed_counter = {}
+        client.domain_counter_lock = Lock()
+
+    def request_with_retry(self,
+                           client: AbstractJmClient,
+                           request: Callable,
+                           url: str,
+                           is_image: bool,
+                           **kwargs,
+                           ):
+        """
+        实现如下域名重试机制：
+        - 对域名列表轮询请求，配置：retry_rounds
+        - 限制单个域名最大失败次数，配置：retry_domain_max_times
+        - 轮询域名列表前，根据历史失败次数对域名列表排序，失败多的后置
+        """
+
+        def do_request(domain):
+            url_to_use = url
+            if url_to_use.startswith('/'):
+                # path → url
+                url_to_use = client.of_api_url(url, domain)
+                client.update_request_with_specify_domain(kwargs, domain, is_image)
+                jm_log(client.log_topic(), client.decode(url_to_use))
+            elif is_image:
+                # 图片url
+                client.update_request_with_specify_domain(kwargs, None, is_image)
+
+            resp = request(url_to_use, **kwargs)
+            resp = client.raise_if_resp_should_retry(resp, is_image)
+            return resp
+
+        retry_domain_max_times: int = self.retry_config['retry_domain_max_times']
+        retry_rounds: int = self.retry_config['retry_rounds']
+        retry_errors = []
+        for rindex in range(retry_rounds):
+            domain_list = self.get_sorted_domain(client, retry_domain_max_times)
+            for i, domain in enumerate(domain_list):
+                if self.failed_count(client, domain) >= retry_domain_max_times:
+                    continue
+
+                try:
+                    return do_request(domain)
+                except Exception as e:
+                    jm_log('req.error', e)
+                    retry_errors.append({
+                        'domain': domain,
+                        'url': client.of_api_url(url, domain) if url.startswith('/') else url,
+                        'retry': rindex,
+                        'error': e,
+                    })
+                    self.update_failed_count(client, domain)
+
+        return client.fallback(request, url, 0, 0, is_image,
+                               retry_errors=retry_errors, **kwargs)
+
+    def get_sorted_domain(self, client: JmcomicClient, times):
+        domain_list = client.get_domain_list()
+        return sorted(
+            filter(lambda d: self.failed_count(client, d) < times, domain_list),
+            key=lambda d: self.failed_count(client, d)
+        )
+
+    # noinspection PyUnresolvedReferences
+    def update_failed_count(self, client: AbstractJmClient, domain: str):
+        with client.domain_counter_lock:
+            client.domain_req_failed_counter[domain] = self.failed_count(client, domain) + 1
+
+    @staticmethod
+    def failed_count(client: JmcomicClient, domain: str) -> int:
+        # noinspection PyUnresolvedReferences
+        return client.domain_req_failed_counter.get(domain, 0)
+
+
+class DownloadCoverPlugin(JmOptionPlugin):
+    plugin_key = 'download_cover'
+
+    def invoke(self,
+               dir_rule: dict,
+               size='',
+               photo: JmPhotoDetail = None,
+               album: JmAlbumDetail = None,
+               downloader=None,
+               **kwargs) -> None:
+        album_id = album.id if album else photo.album_id
+        save_path = self.decide_filepath(
+            album, photo,
+            None, None, None,
+            dir_rule
+        )
+        if self.option.download.cache and os.path.exists(save_path):
+            self.log(f'album-{album_id}的封面已存在，跳过下载: [{save_path}]', 'skip')
+            return
+        downloader.client.download_album_cover(album_id, save_path, size)
